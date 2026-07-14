@@ -1,0 +1,693 @@
+from flask import Flask, request, render_template_string, send_file, redirect
+from encryption import encrypt_file, decrypt_file, calculate_hash
+from blockchain import check_access, upload_file_to_blockchain
+from ai_module.anomaly_detection import detect_anomaly
+
+
+from alerts import security_alert
+
+import os
+import datetime
+import threading
+import time
+
+from collections import defaultdict
+
+app = Flask(__name__)
+
+# ===============================
+# FOLDERS
+# ===============================
+
+UPLOAD_FOLDER = 'uploads'
+ENCRYPTED_FOLDER = 'encrypted_files'
+DECRYPTED_FOLDER = 'decrypted_files'
+QUARANTINE_FOLDER = 'quarantine_files'
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(ENCRYPTED_FOLDER, exist_ok=True)
+os.makedirs(DECRYPTED_FOLDER, exist_ok=True)
+os.makedirs(QUARANTINE_FOLDER, exist_ok=True)
+
+# ===============================
+# GLOBAL VARIABLES
+# ===============================
+
+attack_counter = 0
+
+failed_attempts = defaultdict(int)
+total_attempts = defaultdict(int)
+risk_scores = defaultdict(int)
+
+file_hashes = {}
+file_owners = {}
+
+file_access_counter = defaultdict(int)
+
+access_logs = []
+
+blocked_ips = set()
+
+threat_level = "🟢 LOW RISK"
+system_lockdown = False
+
+last_tx_hash = ""
+
+total_files = 0
+total_access = 0
+total_failed = 0
+
+blocked_ip_count = 0
+attack_detected = 0
+quarantined_files = 0
+
+
+# ===============================
+# AI INTRUSION PREDICTION
+# ===============================
+
+def predict_intrusion():
+
+    total_fail = sum(failed_attempts.values())
+    total_try = sum(total_attempts.values())
+
+    if total_try == 0:
+        return "🟢 System behaviour normal"
+
+    ratio = total_fail / total_try
+
+    if ratio >= 0.6:
+        return "🔴 High probability of cyber attack"
+    elif ratio >= 0.3:
+        return "🟡 Suspicious activity detected"
+    else:
+        return "🟢 System stable"
+
+
+
+# ===============================
+# RESET THREAT AFTER ATTACK
+# ===============================
+
+def reset_threat():
+
+    global threat_level, system_lockdown
+
+    time.sleep(30)
+
+    threat_level = "🟢 LOW RISK"
+    system_lockdown = False
+
+    access_logs.append("✅ System threat level reset")
+
+
+# ===============================
+# MAIN PAGE UI
+# ===============================
+
+HTML = """
+
+<html>
+<head>
+
+<title>AI Secure Storage</title>
+
+<style>
+
+body{
+font-family:Arial;
+background:#0f2027;
+color:white;
+text-align:center;
+padding:30px;
+}
+
+.container{
+background:#1c1c1c;
+padding:30px;
+border-radius:12px;
+width:600px;
+margin:auto;
+}
+
+button{
+padding:10px;
+background:#00c6ff;
+border:none;
+border-radius:6px;
+cursor:pointer;
+}
+
+.badge{
+padding:6px;
+border-radius:8px;
+}
+
+.low{background:green}
+.medium{background:orange}
+.high{background:red}
+
+.alert-banner{
+background:#ff1e1e;
+padding:15px;
+border-radius:8px;
+font-weight:bold;
+margin-top:20px;
+animation: blink 1s infinite;
+}
+
+@keyframes blink{
+0%{opacity:1;}
+50%{opacity:0.3;}
+100%{opacity:1;}
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h2>🔐 Secure File Upload</h2>
+
+<form method="POST" enctype="multipart/form-data">
+<input type="file" name="file" required><br><br>
+
+<input type="text" name="owner" placeholder="Ethereum Owner Address" required><br><br>
+
+<button type="submit">Upload & Encrypt</button>
+</form>
+
+<hr>
+
+<h3>⬇ Secure Download</h3>
+
+<form method="POST" action="/download">
+<input type="text" name="filename" placeholder="Filename" required><br><br>
+<input type="text" name="eth_address" placeholder="Ethereum Address" required><br><br>
+<button type="submit">Verify & Download</button>
+</form>
+
+<hr>
+
+<a href="/dashboard">📊 Security Dashboard</a><br><br>
+<a href="/simulate_attack">⚠ Simulate Cyber Attack</a><br><br>
+<a href="/simulate_ransomware">🧨 Simulate Ransomware</a><br><br>
+<a href="/simulate_hacker">💻 Hacker Terminal Simulation</a>
+
+<hr>
+
+<h3>Threat Level</h3>
+
+{% if "HIGH" in threat %}
+<div class="alert-banner">
+🚨 CYBER ATTACK / RANSOMWARE DETECTED 🚨
+</div>
+{% endif %}
+
+<span class="badge">{{threat}}</span>
+
+<h4>Recent Logs</h4>
+
+<ul>
+{% for log in logs %}
+<li>{{log}}</li>
+{% endfor %}
+</ul>
+
+<p>{{msg}}</p>
+<p style="color:red;">{{error}}</p>
+
+</div>
+
+</body>
+</html>
+
+"""
+# ===============================
+# DASHBOARD PAGE UI
+# ===============================
+DASHBOARD_HTML = """
+
+<html>
+<head>
+
+<title>AI Cyber Defense SOC Dashboard</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+
+body{
+background:#0a0f1c;
+color:#00ffff;
+font-family:Consolas,monospace;
+text-align:center;
+padding:20px;
+}
+
+h1{
+text-shadow:0 0 10px #00ffff;
+}
+
+.card{
+display:flex;
+justify-content:center;
+flex-wrap:wrap;
+gap:20px;
+}
+
+.card-content{
+
+background:#111827;
+border:1px solid #00ffff;
+padding:20px;
+border-radius:10px;
+width:200px;
+
+box-shadow:
+0 0 10px #00ffff,
+inset 0 0 10px #00ffff;
+
+}
+
+canvas{
+
+background:#0f172a;
+margin-top:40px;
+
+}
+
+.alert{
+
+background:red;
+padding:15px;
+margin:20px;
+font-weight:bold;
+
+}
+
+ul{
+
+list-style:none;
+
+}
+
+li{
+
+background:#111827;
+margin:5px;
+padding:8px;
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>🛡 AI Cyber Defense SOC Dashboard</h1>
+
+{% if "HIGH" in threat %}
+<div class="alert">
+🚨 SYSTEM LOCKDOWN ACTIVE
+</div>
+{% endif %}
+
+<div class="card">
+
+<div class="card-content">
+<h3>Total Files</h3>
+<h2>{{files}}</h2>
+</div>
+
+<div class="card-content">
+<h3>Total Access</h3>
+<h2>{{access}}</h2>
+</div>
+
+<div class="card-content">
+<h3>Failed Attempts</h3>
+<h2>{{failed}}</h2>
+</div>
+
+<div class="card-content">
+<h3>Threat Level</h3>
+<h2>{{threat}}</h2>
+</div>
+
+<div class="card-content">
+<h3>AI Prediction</h3>
+<h2>{{prediction}}</h2>
+</div>
+
+<div class="card-content">
+<h3>Risk Score</h3>
+<h2>{{risk}}</h2>
+</div>
+
+<div class="card-content">
+<h3>Blocked IPs</h3>
+<h2>{{blocked}}</h2>
+</div>
+
+<div class="card-content">
+<h3>Attacks Detected</h3>
+<h2>{{attacks}}</h2>
+</div>
+
+<div class="card-content">
+<h3>Quarantined Files</h3>
+<h2>{{quarantine}}</h2>
+</div>
+
+
+</div>
+
+<h2>System Activity</h2>
+
+<canvas id="chart" width="400" height="200"></canvas>
+
+<script>
+
+new Chart(document.getElementById("chart"),{
+
+type:"line",
+
+data:{
+labels:["Access","Failed"],
+datasets:[{
+label:"Activity",
+data:[{{access}},{{failed}}],
+borderWidth:3
+}]
+}
+
+});
+
+</script>
+
+<h2>🌍 Global Cyber Attack Monitor</h2>
+
+<div id="map" style="height:400px;width:80%;margin:auto;"></div>
+
+<script>
+
+var map=L.map('map').setView([20,0],2);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+function attack(){
+
+var locs=[
+[37,-122],
+[28,77],
+[35,139],
+[51,-0],
+[-33,151]
+];
+
+var l=locs[Math.floor(Math.random()*locs.length)];
+
+var c=L.circle(l,{
+color:'red',
+fillOpacity:0.5,
+radius:500000
+}).addTo(map);
+
+setTimeout(()=>map.removeLayer(c),3000);
+
+}
+
+setInterval(attack,2000);
+
+</script>
+
+<h2>Recent Logs</h2>
+
+<ul>
+
+{% for log in logs %}
+
+<li>{{log}}</li>
+
+{% endfor %}
+
+</ul>
+
+<br>
+
+<a href="/">Back</a>
+
+</body>
+</html>
+
+"""
+
+# ===============================
+# FILE UPLOAD
+# ===============================
+
+@app.route('/', methods=['GET','POST'])
+def upload():
+
+    global total_files
+
+    msg=""
+    error=""
+
+    if request.method=='POST':
+
+        f=request.files['file']
+        owner=request.form['owner']
+
+        path=os.path.join(UPLOAD_FOLDER,f.filename)
+        f.save(path)
+
+        enc_path=os.path.join(ENCRYPTED_FOLDER,f.filename+".enc")
+
+        encrypt_file(path,enc_path)
+
+        os.remove(path)
+
+        file_hash=calculate_hash(enc_path)
+
+        file_hashes[f.filename]=file_hash
+        file_owners[f.filename]=owner
+
+        try:
+
+            upload_file_to_blockchain(f.filename)
+
+            msg="✅ File encrypted & stored securely"
+
+        except Exception as e:
+            error=str(e)
+
+        total_files+=1
+
+    return render_template_string(
+    HTML,
+    msg=msg,
+    error=error,
+    logs=access_logs[-5:],
+    threat=threat_level
+    )
+
+
+# ===============================
+# FILE DOWNLOAD
+# ===============================
+
+@app.route('/download', methods=['POST'])
+def download():
+
+    global threat_level, system_lockdown, total_access, total_failed
+    global blocked_ip_count, attack_detected, quarantined_files
+
+
+    filename = request.form['filename']
+    user = request.form['eth_address']
+    ip = request.remote_addr
+
+    if system_lockdown:
+        return "🚨 SYSTEM LOCKDOWN ACTIVE"
+
+    if ip in blocked_ips:
+        return "🚫 Your IP is blocked"
+
+    total_access += 1
+    total_attempts[user] += 1
+
+    enc_path = os.path.join(ENCRYPTED_FOLDER, filename + ".enc")
+    dec_path = os.path.join(DECRYPTED_FOLDER, filename)
+
+    if not os.path.exists(enc_path):
+        return "File not found"
+
+    # =========================
+    # HASH VERIFY
+    # =========================
+
+    stored_hash = file_hashes.get(filename)
+    current_hash = calculate_hash(enc_path)
+
+    if stored_hash != current_hash:
+
+        quarantine_path = os.path.join(QUARANTINE_FOLDER, filename + ".enc")
+
+        os.rename(enc_path, quarantine_path)
+        quarantined_files += 1
+
+        access_logs.append("⚠ File moved to quarantine")
+
+        return "File integrity compromised"
+
+    # =========================
+    # BLOCKCHAIN ACCESS CHECK
+    # =========================
+
+    access_allowed = check_access(filename, user)
+
+    if not access_allowed:
+
+        failed_attempts[user] += 1
+        total_failed += 1
+
+        risk_scores[user] += 2
+
+        access_logs.append(
+            f"{datetime.datetime.now()} | UNAUTHORIZED ACCESS | {user} | {ip}"
+        )
+
+        anomaly = detect_anomaly(user)
+
+        if anomaly:
+            risk_scores[user] += 3
+            access_logs.append("🤖 AI detected abnormal behaviour")
+
+    else:
+
+        risk_scores[user] = max(0, risk_scores[user] - 1)
+
+        access_logs.append(
+            f"{datetime.datetime.now()} | ACCESS GRANTED | {user}"
+        )
+
+    # =========================
+    # HIGH RISK TRIGGER
+    # =========================
+
+    if risk_scores[user] >= 6:
+
+        threat_level = "🔴 HIGH RISK"
+        system_lockdown = True
+
+        blocked_ips.add(ip)
+        attack_detected += 1
+        blocked_ip_count += 1
+
+
+        access_logs.append(f"🚫 IP BLOCKED: {ip}")
+
+        security_alert(user, ip, filename, risk_scores[user])
+
+        threading.Thread(target=reset_threat).start()
+
+        return "⛔ Access Denied"
+
+    # =========================
+    # FILE DECRYPTION
+    # =========================
+
+    decrypt_file(enc_path, dec_path)
+
+    return send_file(dec_path, as_attachment=True)
+
+
+# ===============================
+# CYBER ATTACK SIMULATION
+# ===============================
+
+@app.route('/simulate_attack')
+def simulate_attack():
+
+    global threat_level,attack_counter
+
+    attack_counter+=1
+
+    threat_level="🔴 HIGH RISK"
+
+    access_logs.append("⚠ Simulated Cyber Attack")
+
+    threading.Thread(target=reset_threat).start()
+
+    return redirect("/")
+
+
+# ===============================
+# RANSOMWARE SIMULATION
+# ===============================
+
+@app.route('/simulate_ransomware')
+def simulate_ransomware():
+
+    global threat_level
+
+    threat_level="🔴 HIGH RISK"
+
+    access_logs.append("🧨 Ransomware behaviour detected")
+
+    threading.Thread(target=reset_threat).start()
+
+    return redirect("/")
+
+
+# ===============================
+# DASHBOARD
+# ===============================
+
+@app.route('/dashboard')
+def dashboard():
+
+    prediction = predict_intrusion()
+
+    total_risk = sum(risk_scores.values())
+
+    return render_template_string(
+        DASHBOARD_HTML,
+        files=total_files,
+        access=total_access,
+        failed=total_failed,
+        threat=threat_level,
+        prediction=prediction,
+        risk=total_risk,
+        blocked=blocked_ip_count,
+        attacks=attack_detected,
+        quarantine=quarantined_files,
+        logs=access_logs[-10:]
+    )
+
+
+
+
+# ===============================
+# HACKER TERMINAL SIMULATION
+# ===============================
+
+@app.route('/simulate_hacker')
+def simulate_hacker():
+
+    return "<h2>⚠ Hacker Simulation Running...</h2><br><a href='/'>Return</a>"
+
+
+# ===============================
+
+if __name__ == '__main__':
+    app.run(debug=True)
